@@ -1,41 +1,73 @@
-// Package ui renders a full-screen, terminal-sized table.
+// Package ui renders Terraform state as a full-screen, terminal-sized table.
 package ui
 
 import (
+	"context"
+	"fmt"
+
 	"charm.land/bubbles/v2/table"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+
+	"github.com/teemuteemu/tf-mankeli/pkg/tfstate"
 )
 
 var baseStyle = lipgloss.NewStyle().
 	BorderStyle(lipgloss.NormalBorder()).
 	BorderForeground(lipgloss.Color("240"))
 
-// columnWeights sets each column's relative share of the terminal width.
-var columnWeights = []int{1, 4, 4, 3}
+var messageStyle = lipgloss.NewStyle().Padding(1, 2)
+
+// column is a table column and its relative share of the terminal width.
+type column struct {
+	title  string
+	weight int
+}
+
+var columns = []column{
+	{"Address", 4},
+	{"Type", 3},
+	{"Name", 2},
+	{"Module", 2},
+	{"Provider", 3},
+	{"Mode", 1},
+}
 
 var totalWeight = func() int {
 	sum := 0
-	for _, w := range columnWeights {
-		sum += w
+	for _, c := range columns {
+		sum += c.weight
 	}
 	return sum
 }()
 
-type model struct {
-	table table.Model
+// stateLoadedMsg carries the result of reading the state.
+type stateLoadedMsg struct {
+	resources []tfstate.Resource
+	err       error
 }
 
-// Run shows the given columns and rows in a table and blocks until the user quits.
-func Run(columns []table.Column, rows []table.Row) error {
-	_, err := tea.NewProgram(model{newTable(columns, rows)}).Run()
+type model struct {
+	dir     string
+	table   table.Model
+	loading bool
+	err     error
+}
+
+// Run shows the state of the Terraform working directory dir and blocks until the user quits.
+func Run(dir string) error {
+	_, err := tea.NewProgram(newModel(dir)).Run()
 	return err
 }
 
-func newTable(columns []table.Column, rows []table.Row) table.Model {
+func newModel(dir string) model {
+	cols := make([]table.Column, len(columns))
+	for i, c := range columns {
+		cols[i] = table.Column{Title: c.title, Width: len(c.title)}
+	}
+
 	t := table.New(
-		table.WithColumns(columns),
-		table.WithRows(rows),
+		table.WithColumns(cols),
 		table.WithFocused(true),
 	)
 
@@ -50,14 +82,36 @@ func newTable(columns []table.Column, rows []table.Row) table.Model {
 		Background(lipgloss.Color("57")).
 		Bold(false)
 	t.SetStyles(s)
-	return t
+
+	return model{dir: dir, table: t, loading: true}
 }
 
-func (m model) Init() tea.Cmd { return nil }
+func (m model) Init() tea.Cmd { return loadState(m.dir) }
+
+// loadState reads the state in the background so the UI stays responsive.
+func loadState(dir string) tea.Cmd {
+	return func() tea.Msg {
+		resources, err := tfstate.Load(context.Background(), dir)
+		return stateLoadedMsg{resources: resources, err: err}
+	}
+}
+
+func toRows(resources []tfstate.Resource) []table.Row {
+	rows := make([]table.Row, len(resources))
+	for i, r := range resources {
+		rows[i] = table.Row{r.Address, r.Type, r.Name, r.Module, r.Provider, r.Mode}
+	}
+	return rows
+}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
+	case stateLoadedMsg:
+		m.loading = false
+		m.err = msg.err
+		m.table.SetRows(toRows(msg.resources))
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
 	case tea.KeyPressMsg:
@@ -70,10 +124,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "q", "ctrl+c":
 			return m, tea.Quit
-		case "enter":
-			return m, tea.Batch(
-				tea.Printf("Let's go to %s!", m.table.SelectedRow()[1]),
-			)
 		}
 	}
 	m.table, cmd = m.table.Update(msg)
@@ -101,14 +151,26 @@ func (m *model) resize(width, height int) {
 			cols[i].Width = available - used
 			break
 		}
-		cols[i].Width = available * columnWeights[i] / totalWeight
+		cols[i].Width = available * columns[i].weight / totalWeight
 		used += cols[i].Width
 	}
 	m.table.SetColumns(cols)
 }
 
 func (m model) View() tea.View {
-	v := tea.NewView(baseStyle.Render(m.table.View()) + "\n  " + m.table.HelpView())
+	var content string
+	switch {
+	case m.loading:
+		content = messageStyle.Render(fmt.Sprintf("Loading Terraform state from %s…", m.dir))
+	case m.err != nil:
+		content = messageStyle.Render(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
+	case len(m.table.Rows()) == 0:
+		content = messageStyle.Render("No resources in state.\n\nPress q to quit.")
+	default:
+		content = baseStyle.Render(m.table.View()) + "\n  " + m.table.HelpView()
+	}
+
+	v := tea.NewView(content)
 	v.AltScreen = true
 	return v
 }
