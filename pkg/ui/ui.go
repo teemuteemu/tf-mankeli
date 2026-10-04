@@ -26,13 +26,16 @@ var baseStyle = lipgloss.NewStyle().
 	BorderStyle(lipgloss.NormalBorder()).
 	BorderForeground(lipgloss.Color("240"))
 
-var activeBorderColor = lipgloss.Color("62")
+var (
+	activeBorderColor = lipgloss.Color("62")
+	errorColor        = lipgloss.Color("196")
+)
 
 var (
 	messageStyle = lipgloss.NewStyle().Padding(1, 2)
 	titleStyle   = lipgloss.NewStyle().Bold(true)
 	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	errorStyle   = lipgloss.NewStyle().Foreground(errorColor)
 )
 
 // actionStyle colors an action the way Terraform's plan output does.
@@ -239,6 +242,11 @@ type model struct {
 	planning bool
 	planErr  error
 
+	// The error pane shows the current failure in full, taking the table's place.
+	errPane   viewport.Model
+	errHidden bool   // dismissed by the user; the status line still shows the failure
+	errText   string // the failure in the pane, to tell a new one from a resize
+
 	confirm       *confirmation // shown as a dialog while non-nil
 	prompt        *prompt       // shown as a dialog while non-nil
 	targeting     string        // address being planned for a targeted apply or destroy
@@ -336,7 +344,14 @@ func newModel(dir string) model {
 		Bold(false)
 	t.SetStyles(s)
 
-	return model{dir: dir, table: t, details: viewport.New(), loading: true, planning: true}
+	return model{
+		dir:      dir,
+		table:    t,
+		details:  viewport.New(),
+		errPane:  viewport.New(),
+		loading:  true,
+		planning: true,
+	}
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -451,6 +466,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case msg.err != nil:
 			m.actionErr = msg.err
+			m.refreshError()
 		case !msg.plan.HasChanges():
 			msg.plan.Discard()
 			m.notice = fmt.Sprintf("No changes for %s.", msg.address)
@@ -474,6 +490,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Even a failed apply may have changed some resources, so plan again either way.
 		m.loading, m.planning = true, true
 		m.err, m.planErr = nil, nil
+		m.refreshError()
 		return m, m.replan()
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
@@ -613,6 +630,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.running = fmt.Sprintf("Tainting %s…", r.Address)
 			return m, taint(m.dir, r.Address)
+		case "e":
+			// Toggle the full error back on after dismissing it.
+			if _, err := m.failure(); err != nil {
+				m.errHidden = !m.errHidden
+				return m, nil
+			}
 		case "enter":
 			if m.focus == tablePane {
 				m.openDetails()
@@ -628,6 +651,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc":
+			// The error covers the table, so dismiss it before closing details.
+			if m.showErrorPane() {
+				m.errHidden = true
+				return m, nil
+			}
 			if m.showDetails {
 				m.showDetails = false
 				m.setFocus(tablePane)
@@ -637,6 +665,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.focus == detailsPane {
 			m.details, cmd = m.details.Update(msg)
+			return m, cmd
+		}
+		// The error pane stands in for the table, so it takes the table's keys.
+		if m.showErrorPane() {
+			m.errPane, cmd = m.errPane.Update(msg)
 			return m, cmd
 		}
 	}
@@ -702,6 +735,51 @@ func (m model) updatePrompt(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m *model) clearOutcome() {
 	m.actionErr = nil
 	m.notice = ""
+	m.refreshError()
+}
+
+// failure returns the error worth showing, most recent first, with a title
+// completing the sentence "<title> failed". It returns a nil error when
+// nothing has failed.
+func (m model) failure() (string, error) {
+	switch {
+	case m.actionErr != nil:
+		// The error already names the action, e.g. "applying: …".
+		return "Terraform", m.actionErr
+	case m.err != nil:
+		return "Reading the state", m.err
+	case m.planErr != nil:
+		return "Plan", m.planErr
+	}
+	return "", nil
+}
+
+// showErrorPane reports whether the error pane takes the table's place.
+func (m model) showErrorPane() bool {
+	_, err := m.failure()
+	return err != nil && !m.errHidden
+}
+
+// refreshError renders the current failure into the error pane, wrapped to its
+// width. A failure the user hasn't seen yet reopens the pane and scrolls it
+// back to the top; re-rendering the same one after a resize leaves both alone.
+func (m *model) refreshError() {
+	title, err := m.failure()
+	if err == nil {
+		m.errText = ""
+		return
+	}
+
+	text := strings.TrimSpace(err.Error())
+	if text != m.errText {
+		m.errText = text
+		m.errHidden = false
+		m.errPane.GotoTop()
+	}
+	if w := m.errPane.Width(); w > 0 {
+		text = lipgloss.NewStyle().Width(w).Render(text)
+	}
+	m.errPane.SetContent(errorStyle.Bold(true).Render(title+" failed") + "\n\n" + text)
 }
 
 // rebuild merges the state with the plan and refreshes the table and the
@@ -724,6 +802,7 @@ func (m *model) rebuild() {
 	if i := m.indexOf(m.detailsAddress); m.showDetails && i >= 0 {
 		m.details.SetContent(renderDetails(m.rows[i]))
 	}
+	m.refreshError()
 }
 
 func (m model) indexOf(address string) int {
@@ -844,6 +923,11 @@ func (m *model) layout() {
 	m.table.SetHeight(tableHeight)
 	m.table.SetColumns(scaleColumns(m.table.Columns(), paneWidth))
 
+	// The error pane stands in for the table, so it gets the same box.
+	m.errPane.SetWidth(paneWidth)
+	m.errPane.SetHeight(tableHeight)
+	m.refreshError()
+
 	if m.confirm != nil {
 		const (
 			dialogPadding = 2 // one cell left and right
@@ -906,10 +990,6 @@ func (m model) paneStyle(p pane) lipgloss.Style {
 func (m model) statusView() string {
 	width := max(m.width-2, 0)
 	style := helpStyle.MaxWidth(width)
-	// Terraform errors span several lines; squeeze them onto the status line.
-	failed := func(what string, err error) string {
-		return errorStyle.MaxWidth(width).Render(what + " failed: " + strings.Join(strings.Fields(err.Error()), " "))
-	}
 
 	switch {
 	case m.running != "":
@@ -918,9 +998,16 @@ func (m model) statusView() string {
 		return style.Render(fmt.Sprintf("Planning destruction of %s…", m.targeting))
 	case m.targeting != "":
 		return style.Render(fmt.Sprintf("Planning changes for %s…", m.targeting))
-	case m.actionErr != nil:
-		// The error already says what failed, e.g. "applying: …".
-		return errorStyle.MaxWidth(width).Render("Failed: " + strings.Join(strings.Fields(m.actionErr.Error()), " "))
+	}
+
+	// The error pane shows the failure in full, so name it here and no more.
+	// Once dismissed, squeeze it onto this line so it isn't lost entirely.
+	if title, err := m.failure(); err != nil {
+		text := title + " failed."
+		if m.errHidden {
+			text = title + " failed: " + strings.Join(strings.Fields(err.Error()), " ")
+		}
+		return errorStyle.MaxWidth(width).Render(text)
 	}
 
 	status := ""
@@ -929,8 +1016,6 @@ func (m model) statusView() string {
 		status = "Reading state and planning…"
 	case m.planning:
 		status = "Planning…"
-	case m.planErr != nil:
-		return failed("Plan", m.planErr)
 	default:
 		status = summarize(m.changes())
 	}
@@ -966,7 +1051,14 @@ func (m model) helpView() string {
 	if m.focus == detailsPane {
 		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • d remove from state • shift+d destroy • i import • t taint/untaint • tab table • esc close • p plan • q quit")
 	}
+	// The error pane covers the table, so none of the table's keys apply.
+	if m.showErrorPane() {
+		return helpStyle.Render("↑/↓ scroll • esc dismiss • p plan • q quit")
+	}
 	extra := "enter details • a apply • shift+a apply all • d remove from state • shift+d destroy • i import • t taint/untaint • p plan"
+	if _, err := m.failure(); err != nil {
+		extra += " • e error"
+	}
 	if m.showDetails {
 		extra += " • tab details • esc close"
 	}
@@ -1016,14 +1108,17 @@ func (m model) View() tea.View {
 	case m.prompt != nil:
 		content = m.promptView()
 	// While planning again, keep showing the previous rows until the new state arrives.
-	case m.loading && len(m.rows) == 0:
+	case m.loading && len(m.rows) == 0 && !m.showErrorPane():
 		content = messageStyle.Render(fmt.Sprintf("Loading Terraform state from %s…", m.dir))
-	case m.err != nil:
-		content = messageStyle.Render(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
-	case len(m.rows) == 0 && !m.planning && m.planErr == nil:
+	case len(m.rows) == 0 && !m.planning && !m.showErrorPane():
 		content = messageStyle.Render("No resources in state or plan.\n\nPress q to quit.")
 	default:
-		content = m.paneStyle(tablePane).Render(m.table.View())
+		// A failure replaces the table, keeping the status and help lines in view.
+		if m.showErrorPane() {
+			content = m.paneStyle(tablePane).BorderForeground(errorColor).Render(m.errPane.View())
+		} else {
+			content = m.paneStyle(tablePane).Render(m.table.View())
+		}
 		if m.showDetails {
 			content = lipgloss.JoinVertical(lipgloss.Left,
 				content,
