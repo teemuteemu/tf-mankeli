@@ -79,6 +79,31 @@ func RemoveFromState(ctx context.Context, dir, address string) error {
 	return nil
 }
 
+// Taint marks the resource at address to be replaced on the next apply, like
+// `terraform taint`. Only the state changes until then.
+func Taint(ctx context.Context, dir, address string) error {
+	tf, err := newTerraform(dir)
+	if err != nil {
+		return err
+	}
+	if err := tf.Taint(ctx, address); err != nil {
+		return fmt.Errorf("tainting %s: %w", address, err)
+	}
+	return nil
+}
+
+// Untaint removes the mark Taint sets, like `terraform untaint`.
+func Untaint(ctx context.Context, dir, address string) error {
+	tf, err := newTerraform(dir)
+	if err != nil {
+		return err
+	}
+	if err := tf.Untaint(ctx, address); err != nil {
+		return fmt.Errorf("untainting %s: %w", address, err)
+	}
+	return nil
+}
+
 func plan(ctx context.Context, dir string, destroy bool, targets []string) (*SavedPlan, error) {
 	tf, err := newTerraform(dir)
 	if err != nil {

@@ -81,6 +81,7 @@ type column struct {
 
 var columns = []column{
 	{title: "", width: 3}, // planned action
+	{title: "", width: 7}, // tainted marker
 	{title: "Address", weight: 4},
 	{title: "Type", weight: 3},
 	{title: "Name", weight: 2},
@@ -347,6 +348,20 @@ func apply(plan *tfstate.SavedPlan) tea.Cmd {
 	}
 }
 
+func taint(dir, address string) tea.Cmd {
+	return func() tea.Msg {
+		err := tfstate.Taint(context.Background(), dir, address)
+		return actionDoneMsg{done: fmt.Sprintf("Tainted %s.", address), err: err}
+	}
+}
+
+func untaint(dir, address string) tea.Cmd {
+	return func() tea.Msg {
+		err := tfstate.Untaint(context.Background(), dir, address)
+		return actionDoneMsg{done: fmt.Sprintf("Untainted %s.", address), err: err}
+	}
+}
+
 func removeFromState(dir, address string) tea.Cmd {
 	return func() tea.Msg {
 		err := tfstate.RemoveFromState(context.Background(), dir, address)
@@ -360,7 +375,11 @@ func removeFromState(dir, address string) tea.Cmd {
 func toRows(resources []tfstate.Resource, selected int) []table.Row {
 	rows := make([]table.Row, len(resources))
 	for i, r := range resources {
-		row := table.Row{string(r.Action()), r.Address, r.Type, r.Name, r.Module, r.Provider, r.Mode}
+		tainted := ""
+		if r.Tainted {
+			tainted = "tainted"
+		}
+		row := table.Row{string(r.Action()), tainted, r.Address, r.Type, r.Name, r.Module, r.Provider, r.Mode}
 		if i != selected && r.Action() != tfstate.NoOp {
 			style := actionStyle(r.Action())
 			for j, cell := range row {
@@ -435,7 +454,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, tea.Quit
-		case "P", "shift+p":
+		case "p":
 			// Ignore repeats while Terraform runs, so results can't arrive out of order.
 			if m.busy() {
 				return m, nil
@@ -510,6 +529,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirm = confirmRemove(r)
 			m.layout()
 			return m, nil
+		case "t":
+			if m.busy() {
+				return m, nil
+			}
+			m.clearOutcome()
+			r, ok := m.selected()
+			if !ok {
+				return m, nil
+			}
+			switch {
+			case !m.inState(r.Address):
+				m.notice = fmt.Sprintf("%s doesn't exist yet.", r.Address)
+				return m, nil
+			case r.Mode == "data":
+				m.notice = "Data sources can't be tainted."
+				return m, nil
+			}
+			if r.Tainted {
+				m.running = fmt.Sprintf("Untainting %s…", r.Address)
+				return m, untaint(m.dir, r.Address)
+			}
+			m.running = fmt.Sprintf("Tainting %s…", r.Address)
+			return m, taint(m.dir, r.Address)
 		case "enter":
 			if m.focus == tablePane {
 				m.openDetails()
@@ -630,8 +672,11 @@ func renderDetails(r tfstate.Resource) string {
 		before, after = r.Change.Before, r.Change.After
 	}
 
-	return actionStyle(action).Bold(true).Render(title) + "\n\n" +
-		strings.Join(diffLines(before, after), "\n")
+	header := actionStyle(action).Bold(true).Render(title)
+	if r.Tainted {
+		header += "\n" + helpStyle.Render("Tainted: it will be replaced on the next apply.")
+	}
+	return header + "\n\n" + strings.Join(diffLines(before, after), "\n")
 }
 
 // diffLines lists every attribute, prefixed with + if added, - if removed or
@@ -825,9 +870,9 @@ func summarize(changes []tfstate.Change) string {
 
 func (m model) helpView() string {
 	if m.focus == detailsPane {
-		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • d remove from state • shift+d destroy • tab table • esc close • shift+p plan • q quit")
+		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • d remove from state • shift+d destroy • t taint/untaint • tab table • esc close • p plan • q quit")
 	}
-	extra := "enter details • a apply • shift+a apply all • d remove from state • shift+d destroy • shift+p plan"
+	extra := "enter details • a apply • shift+a apply all • d remove from state • shift+d destroy • t taint/untaint • p plan"
 	if m.showDetails {
 		extra += " • tab details • esc close"
 	}

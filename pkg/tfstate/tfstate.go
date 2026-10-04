@@ -30,6 +30,8 @@ type Resource struct {
 	Name     string
 	Module   string // empty for the root module
 	Provider string
+	// Tainted reports whether the resource is marked to be replaced on the next apply.
+	Tainted bool
 	// Attributes holds the resource's values in the state, with sensitive ones
 	// replaced by SensitivePlaceholder. It is nil for resources not yet created.
 	Attributes map[string]any
@@ -108,6 +110,7 @@ func collect(module *tfjson.StateModule, out *[]Resource) error {
 			Name:       r.Name,
 			Module:     module.Address,
 			Provider:   trimProvider(r.ProviderName),
+			Tainted:    r.Tainted,
 			Attributes: attributes,
 		})
 	}
