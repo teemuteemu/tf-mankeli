@@ -79,6 +79,21 @@ func RemoveFromState(ctx context.Context, dir, address string) error {
 	return nil
 }
 
+// Import brings the existing object with the given id into the state as the
+// resource at address, like `terraform import`. The resource must already be
+// in the configuration and must not be in the state yet. No real resource is
+// created: Terraform only reads the object and records it.
+func Import(ctx context.Context, dir, address, id string) error {
+	tf, err := newTerraform(dir)
+	if err != nil {
+		return err
+	}
+	if err := tf.Import(ctx, address, id); err != nil {
+		return fmt.Errorf("importing %s: %w", address, err)
+	}
+	return nil
+}
+
 // Taint marks the resource at address to be replaced on the next apply, like
 // `terraform taint`. Only the state changes until then.
 func Taint(ctx context.Context, dir, address string) error {

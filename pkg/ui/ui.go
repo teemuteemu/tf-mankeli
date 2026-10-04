@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"charm.land/bubbles/v2/table"
+	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -172,6 +173,34 @@ func newConfirmation(c confirmation, sections []string) *confirmation {
 	return &c
 }
 
+// prompt asks the user to type a value, and runs an action with it once the
+// value is submitted.
+type prompt struct {
+	title   string
+	help    string
+	verb    string // what pressing enter does, for the help line
+	address string // resource the value applies to
+	input   textinput.Model
+}
+
+// promptImport asks for the ID of the object to import as the resource r.
+func promptImport(r tfstate.Resource) (*prompt, tea.Cmd) {
+	in := textinput.New()
+	in.Prompt = "ID: "
+	in.Placeholder = "the ID the provider identifies the existing object by"
+	cmd := in.Focus()
+
+	return &prompt{
+		title: fmt.Sprintf("Import %s", r.Address),
+		help: "Terraform will read the existing object with this ID and record it as this\n" +
+			"resource. No new resource is created. The ID format is the provider's own;\n" +
+			"see the resource type's import documentation.",
+		verb:    "import",
+		address: r.Address,
+		input:   in,
+	}, cmd
+}
+
 func countChanges(changes []tfstate.Change) int {
 	n := 0
 	for _, c := range changes {
@@ -211,6 +240,7 @@ type model struct {
 	planErr  error
 
 	confirm       *confirmation // shown as a dialog while non-nil
+	prompt        *prompt       // shown as a dialog while non-nil
 	targeting     string        // address being planned for a targeted apply or destroy
 	targetDestroy bool          // the targeted plan destroys
 	running       string        // status text while applying or removing from state
@@ -362,6 +392,13 @@ func untaint(dir, address string) tea.Cmd {
 	}
 }
 
+func importResource(dir, address, id string) tea.Cmd {
+	return func() tea.Msg {
+		err := tfstate.Import(context.Background(), dir, address, id)
+		return actionDoneMsg{done: fmt.Sprintf("Imported %s.", address), err: err}
+	}
+}
+
 func removeFromState(dir, address string) tea.Cmd {
 	return func() tea.Msg {
 		err := tfstate.RemoveFromState(context.Background(), dir, address)
@@ -446,6 +483,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirm != nil {
 			return m.updateConfirm(msg)
 		}
+		if m.prompt != nil {
+			return m.updatePrompt(msg)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			// Quitting would leave Terraform changing things with nobody watching.
@@ -529,6 +569,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.confirm = confirmRemove(r)
 			m.layout()
 			return m, nil
+		case "i":
+			if m.busy() {
+				return m, nil
+			}
+			m.clearOutcome()
+			r, ok := m.selected()
+			if !ok {
+				return m, nil
+			}
+			switch {
+			case m.inState(r.Address):
+				m.notice = fmt.Sprintf("%s is already in the state.", r.Address)
+				return m, nil
+			case r.Mode == "data":
+				m.notice = "Data sources can't be imported."
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.prompt, cmd = promptImport(r)
+			m.layout()
+			return m, cmd
 		case "t":
 			if m.busy() {
 				return m, nil
@@ -610,6 +671,31 @@ func (m model) updateConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.confirm.body, cmd = m.confirm.body.Update(msg)
+	return m, cmd
+}
+
+// updatePrompt handles keys while the value prompt is shown. Every key that
+// isn't enter or escape goes to the text input, so that letters bound to
+// actions in the table are typed rather than acted on.
+func (m model) updatePrompt(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		p := m.prompt
+		id := strings.TrimSpace(p.input.Value())
+		// Submitting nothing would import an empty ID; keep asking instead.
+		if id == "" {
+			return m, nil
+		}
+		m.prompt = nil
+		m.running = fmt.Sprintf("Importing %s…", p.address)
+		return m, importResource(m.dir, p.address, id)
+	case "esc", "ctrl+c":
+		m.prompt = nil
+		m.notice = "Canceled."
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.prompt.input, cmd = m.prompt.input.Update(msg)
 	return m, cmd
 }
 
@@ -766,6 +852,14 @@ func (m *model) layout() {
 		m.confirm.body.SetWidth(max(paneWidth-dialogPadding, 0))
 		m.confirm.body.SetHeight(max(m.height-borderSize-dialogLines, 0))
 	}
+
+	if m.prompt != nil {
+		const (
+			dialogPadding = 2 // one cell left and right
+			promptWidth   = 4 // the input's own "ID: " prompt
+		)
+		m.prompt.input.SetWidth(max(paneWidth-dialogPadding-promptWidth, 0))
+	}
 }
 
 // scaleColumns gives fixed-width columns their width and splits the rest of
@@ -870,9 +964,9 @@ func summarize(changes []tfstate.Change) string {
 
 func (m model) helpView() string {
 	if m.focus == detailsPane {
-		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • d remove from state • shift+d destroy • t taint/untaint • tab table • esc close • p plan • q quit")
+		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • d remove from state • shift+d destroy • i import • t taint/untaint • tab table • esc close • p plan • q quit")
 	}
-	extra := "enter details • a apply • shift+a apply all • d remove from state • shift+d destroy • t taint/untaint • p plan"
+	extra := "enter details • a apply • shift+a apply all • d remove from state • shift+d destroy • i import • t taint/untaint • p plan"
 	if m.showDetails {
 		extra += " • tab details • esc close"
 	}
@@ -896,11 +990,31 @@ func (m model) confirmView() string {
 		Render(strings.Join(lines, "\n"))
 }
 
+// promptView is a dialog asking for a single value, with the text input focused.
+func (m model) promptView() string {
+	lines := []string{
+		titleStyle.Render(m.prompt.title),
+		"",
+		helpStyle.Render(m.prompt.help),
+		"",
+		m.prompt.input.View(),
+		"",
+		helpStyle.Render(fmt.Sprintf("enter %s • esc cancel", m.prompt.verb)),
+	}
+	return baseStyle.
+		BorderForeground(activeBorderColor).
+		Padding(0, 1).
+		Width(max(m.width-2, 0)).
+		Render(strings.Join(lines, "\n"))
+}
+
 func (m model) View() tea.View {
 	var content string
 	switch {
 	case m.confirm != nil:
 		content = m.confirmView()
+	case m.prompt != nil:
+		content = m.promptView()
 	// While planning again, keep showing the previous rows until the new state arrives.
 	case m.loading && len(m.rows) == 0:
 		content = messageStyle.Render(fmt.Sprintf("Loading Terraform state from %s…", m.dir))

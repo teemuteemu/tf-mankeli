@@ -61,3 +61,11 @@ module "pets" {
 output "pet_names" {
   value = module.pets.names
 }
+
+resource "random_string" "import" {
+  length = 3
+}
+
+output "random_str_value" {
+  value = random_string.import
+}
