@@ -42,31 +42,77 @@ type Change struct {
 	After  map[string]any
 }
 
+// SavedPlan is a plan kept on disk, so that exactly the changes it shows can
+// be applied. The plan file holds sensitive values in clear text: call Apply
+// or Discard once it is no longer needed.
+type SavedPlan struct {
+	Changes []Change
+
+	tf  *tfexec.Terraform
+	tmp string // temporary directory holding the plan file
+}
+
 // Plan runs `terraform plan` in the working directory dir and returns the
-// planned change of every resource.
-func Plan(ctx context.Context, dir string) ([]Change, error) {
+// planned change of every resource. With targets, the plan is limited to
+// those resource addresses and the resources they depend on.
+func Plan(ctx context.Context, dir string, targets ...string) (*SavedPlan, error) {
 	tf, err := newTerraform(dir)
 	if err != nil {
 		return nil, err
 	}
 
-	// The plan file holds sensitive values in clear text, so keep it only as long as needed.
 	tmp, err := os.MkdirTemp("", "tf-mankeli-")
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmp)
-	planFile := filepath.Join(tmp, "tfplan")
+	p := &SavedPlan{tf: tf, tmp: tmp}
 
-	// Don't hold the state lock: this plan is only viewed and can take a while.
-	if _, err := tf.Plan(ctx, tfexec.Out(planFile), tfexec.Lock(false)); err != nil {
+	// Don't hold the state lock while planning: it can take a while. Applying
+	// takes the lock and refuses the plan if the state changed in between.
+	opts := []tfexec.PlanOption{tfexec.Out(p.file()), tfexec.Lock(false)}
+	for _, target := range targets {
+		opts = append(opts, tfexec.Target(target))
+	}
+	if _, err := tf.Plan(ctx, opts...); err != nil {
+		p.Discard()
 		return nil, fmt.Errorf("planning: %w", err)
 	}
-	plan, err := tf.ShowPlanFile(ctx, planFile)
+	plan, err := tf.ShowPlanFile(ctx, p.file())
 	if err != nil {
+		p.Discard()
 		return nil, fmt.Errorf("reading plan: %w", err)
 	}
 
+	p.Changes = changesOf(plan)
+	return p, nil
+}
+
+// Apply applies the plan and then discards it.
+func (p *SavedPlan) Apply(ctx context.Context) error {
+	defer p.Discard()
+	if err := p.tf.Apply(ctx, tfexec.DirOrPlan(p.file())); err != nil {
+		return fmt.Errorf("applying: %w", err)
+	}
+	return nil
+}
+
+// Discard deletes the plan file. It is safe to call more than once, and on nil.
+func (p *SavedPlan) Discard() {
+	if p != nil {
+		os.RemoveAll(p.tmp)
+	}
+}
+
+// HasChanges reports whether applying the plan would change anything.
+func (p *SavedPlan) HasChanges() bool {
+	return p != nil && slices.ContainsFunc(p.Changes, func(c Change) bool { return c.Action != NoOp })
+}
+
+func (p *SavedPlan) file() string {
+	return filepath.Join(p.tmp, "tfplan")
+}
+
+func changesOf(plan *tfjson.Plan) []Change {
 	var changes []Change
 	for _, rc := range plan.ResourceChanges {
 		// Deposed objects share their address with the current object; skip them.
@@ -86,7 +132,7 @@ func Plan(ctx context.Context, dir string) ([]Change, error) {
 			After:    toMap(markUnknown(after, rc.Change.AfterUnknown)),
 		})
 	}
-	return changes, nil
+	return changes
 }
 
 func actionOf(actions tfjson.Actions) Action {

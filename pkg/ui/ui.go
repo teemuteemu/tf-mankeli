@@ -29,7 +29,8 @@ var activeBorderColor = lipgloss.Color("62")
 
 var (
 	messageStyle = lipgloss.NewStyle().Padding(1, 2)
-	helpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	titleStyle   = lipgloss.NewStyle().Bold(true)
+	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 )
 
@@ -94,10 +95,56 @@ type stateLoadedMsg struct {
 	err       error
 }
 
-// planLoadedMsg carries the result of planning.
+// planLoadedMsg carries the result of planning all changes.
 type planLoadedMsg struct {
-	changes []tfstate.Change
+	plan *tfstate.SavedPlan
+	err  error
+}
+
+// targetPlanMsg carries the result of planning the changes of one resource.
+type targetPlanMsg struct {
+	address string
+	plan    *tfstate.SavedPlan
 	err     error
+}
+
+// appliedMsg carries the result of applying a plan.
+type appliedMsg struct {
+	err error
+}
+
+// confirmation is a plan waiting for the user to confirm applying it.
+type confirmation struct {
+	title    string
+	plan     *tfstate.SavedPlan
+	targeted bool           // the plan was made only for this confirmation
+	body     viewport.Model // every planned change with its attribute diff
+}
+
+func newConfirmation(title string, plan *tfstate.SavedPlan, targeted bool) *confirmation {
+	var changes []string
+	if targeted && countChanges(plan.Changes) > 1 {
+		changes = append(changes, helpStyle.Render("Includes the resources it depends on."))
+	}
+	for _, c := range plan.Changes {
+		if c.Action != tfstate.NoOp {
+			changes = append(changes, renderDetails(tfstate.Resource{Address: c.Address, Change: &c}))
+		}
+	}
+
+	body := viewport.New()
+	body.SetContent(strings.Join(changes, "\n\n"))
+	return &confirmation{title: title, plan: plan, targeted: targeted, body: body}
+}
+
+func countChanges(changes []tfstate.Change) int {
+	n := 0
+	for _, c := range changes {
+		if c.Action != tfstate.NoOp {
+			n++
+		}
+	}
+	return n
 }
 
 // pane identifies which pane receives key presses.
@@ -113,9 +160,9 @@ type model struct {
 	table   table.Model
 	details viewport.Model
 
-	state   []tfstate.Resource
-	changes []tfstate.Change
-	rows    []tfstate.Resource // state merged with the plan, in table row order
+	state []tfstate.Resource
+	plan  *tfstate.SavedPlan // nil until planned, or if planning failed
+	rows  []tfstate.Resource // state merged with the plan, in table row order
 
 	showDetails    bool
 	detailsAddress string // resource shown in the details pane
@@ -127,6 +174,25 @@ type model struct {
 	err      error
 	planning bool
 	planErr  error
+
+	confirm   *confirmation // shown as a dialog while non-nil
+	targeting string        // address being planned for a targeted apply
+	applying  bool
+	actionErr error  // failure of the last targeted plan or apply
+	notice    string // outcome of the last action, shown on the status line
+}
+
+// changes returns the planned changes, or none if there is no plan.
+func (m model) changes() []tfstate.Change {
+	if m.plan == nil {
+		return nil
+	}
+	return m.plan.Changes
+}
+
+// busy reports whether Terraform is running, so no other run should start.
+func (m model) busy() bool {
+	return m.loading || m.planning || m.applying || m.targeting != ""
 }
 
 // Run shows the state and planned changes of the Terraform working directory
@@ -144,13 +210,22 @@ func Run(dir string) error {
 	wg.Wait()
 
 	if state.err != nil {
+		plan.plan.Discard()
 		return state.err
 	}
 
 	var m tea.Model = newModel(dir)
 	m, _ = m.Update(state)
 	m, _ = m.Update(plan)
-	_, err := tea.NewProgram(m).Run()
+	final, err := tea.NewProgram(m).Run()
+
+	// Plan files hold sensitive values; don't leave them behind.
+	if fm, ok := final.(model); ok {
+		fm.plan.Discard()
+		if fm.confirm != nil {
+			fm.confirm.plan.Discard()
+		}
+	}
 	return err
 }
 
@@ -182,9 +257,9 @@ func newModel(dir string) model {
 
 func (m model) Init() tea.Cmd { return nil }
 
-// refresh reads the state and plans again in parallel, so the new state shows
+// replan reads the state and plans again in parallel, so the new state shows
 // up while the slower plan is still running.
-func (m model) refresh() tea.Cmd {
+func (m model) replan() tea.Cmd {
 	return tea.Batch(
 		func() tea.Msg { return readState(m.dir) },
 		func() tea.Msg { return readPlan(m.dir) },
@@ -197,8 +272,21 @@ func readState(dir string) stateLoadedMsg {
 }
 
 func readPlan(dir string) planLoadedMsg {
-	changes, err := tfstate.Plan(context.Background(), dir)
-	return planLoadedMsg{changes: changes, err: err}
+	plan, err := tfstate.Plan(context.Background(), dir)
+	return planLoadedMsg{plan: plan, err: err}
+}
+
+func planTarget(dir, address string) tea.Cmd {
+	return func() tea.Msg {
+		plan, err := tfstate.Plan(context.Background(), dir, address)
+		return targetPlanMsg{address: address, plan: plan, err: err}
+	}
+}
+
+func apply(plan *tfstate.SavedPlan) tea.Cmd {
+	return func() tea.Msg {
+		return appliedMsg{err: plan.Apply(context.Background())}
+	}
 }
 
 // toRows builds the table rows, coloring each by its planned action. The
@@ -233,25 +321,92 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case planLoadedMsg:
 		m.planning = false
 		m.planErr = msg.err
-		m.changes = msg.changes
+		m.plan.Discard()
+		m.plan = msg.plan
 		m.rebuild()
 		return m, nil
+	case targetPlanMsg:
+		m.targeting = ""
+		switch {
+		case msg.err != nil:
+			m.actionErr = msg.err
+		case !msg.plan.HasChanges():
+			msg.plan.Discard()
+			m.notice = fmt.Sprintf("No changes to apply for %s.", msg.address)
+		default:
+			m.confirm = newConfirmation(fmt.Sprintf("Apply changes for %s?", msg.address), msg.plan, true)
+			m.layout()
+		}
+		return m, nil
+	case appliedMsg:
+		m.applying = false
+		if msg.err != nil {
+			m.actionErr = msg.err
+		} else {
+			m.notice = "Applied."
+		}
+		// Even a failed apply may have changed some resources, so plan again either way.
+		m.loading, m.planning = true, true
+		m.err, m.planErr = nil, nil
+		return m, m.replan()
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		return m, nil
 	case tea.KeyPressMsg:
+		if m.confirm != nil {
+			return m.updateConfirm(msg)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
-			return m, tea.Quit
-		case "ctrl+r":
-			// Ignore repeats while a refresh is running, so results can't arrive out of order.
-			if m.loading || m.planning {
+			// Quitting would leave Terraform applying with nobody watching.
+			if m.applying {
+				m.notice = "Apply in progress; quit once it has finished."
 				return m, nil
 			}
+			return m, tea.Quit
+		case "P", "shift+p":
+			// Ignore repeats while Terraform runs, so results can't arrive out of order.
+			if m.busy() {
+				return m, nil
+			}
+			m.clearOutcome()
 			m.loading, m.planning = true, true
 			m.err, m.planErr = nil, nil
-			return m, m.refresh()
+			return m, m.replan()
+		case "A", "shift+a":
+			if m.busy() {
+				return m, nil
+			}
+			m.clearOutcome()
+			if !m.plan.HasChanges() {
+				m.notice = "No changes to apply."
+				return m, nil
+			}
+			m.confirm = newConfirmation("Apply all changes?", m.plan, false)
+			m.layout()
+			return m, nil
+		case "a":
+			if m.busy() {
+				return m, nil
+			}
+			m.clearOutcome()
+			i := m.table.Cursor()
+			if m.focus == detailsPane {
+				i = m.indexOf(m.detailsAddress)
+			}
+			if i < 0 || i >= len(m.rows) {
+				return m, nil
+			}
+			r := m.rows[i]
+			if r.Action() == tfstate.NoOp {
+				m.notice = fmt.Sprintf("No changes to apply for %s.", r.Address)
+				return m, nil
+			}
+			// Plan again for just this resource, so the dialog shows exactly what
+			// will be applied, including resources it depends on.
+			m.targeting = r.Address
+			return m, planTarget(m.dir, r.Address)
 		case "enter":
 			if m.focus == tablePane {
 				m.openDetails()
@@ -288,6 +443,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// updateConfirm handles keys while the confirmation dialog is shown.
+func (m model) updateConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y":
+		plan := m.confirm.plan
+		m.confirm = nil
+		m.applying = true
+		return m, apply(plan)
+	case "n", "esc", "q", "ctrl+c":
+		if m.confirm.targeted {
+			m.confirm.plan.Discard()
+		}
+		m.confirm = nil
+		m.notice = "Apply canceled."
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.confirm.body, cmd = m.confirm.body.Update(msg)
+	return m, cmd
+}
+
+func (m *model) clearOutcome() {
+	m.actionErr = nil
+	m.notice = ""
+}
+
 // rebuild merges the state with the plan and refreshes the table and the
 // details pane, keeping the cursor on the same resource.
 func (m *model) rebuild() {
@@ -296,7 +477,7 @@ func (m *model) rebuild() {
 		selected = m.rows[i].Address
 	}
 
-	m.rows = tfstate.Merge(m.state, m.changes)
+	m.rows = tfstate.Merge(m.state, m.changes())
 	cursor := m.indexOf(selected)
 	if cursor < 0 {
 		cursor = min(m.table.Cursor(), len(m.rows)-1)
@@ -424,6 +605,15 @@ func (m *model) layout() {
 	m.table.SetWidth(paneWidth)
 	m.table.SetHeight(tableHeight)
 	m.table.SetColumns(scaleColumns(m.table.Columns(), paneWidth))
+
+	if m.confirm != nil {
+		const (
+			dialogPadding = 2 // one cell left and right
+			dialogLines   = 5 // title, summary, help and the blank lines between
+		)
+		m.confirm.body.SetWidth(max(paneWidth-dialogPadding, 0))
+		m.confirm.body.SetHeight(max(m.height-borderSize-dialogLines, 0))
+	}
 }
 
 // scaleColumns gives fixed-width columns their width and splits the rest of
@@ -465,22 +655,46 @@ func (m model) paneStyle(p pane) lipgloss.Style {
 	return baseStyle
 }
 
-// statusView summarizes the plan like the last line of `terraform plan`.
+// statusView shows what Terraform is doing, the outcome of the last action
+// and a summary of the plan like the last line of `terraform plan`.
 func (m model) statusView() string {
-	style := helpStyle.MaxWidth(max(m.width-2, 0))
-	switch {
-	case m.loading:
-		return style.Render("Refreshing state and plan…")
-	case m.planning:
-		return style.Render("Planning…")
-	case m.planErr != nil:
-		// Terraform errors span several lines; squeeze them onto the status line.
-		return errorStyle.MaxWidth(max(m.width-2, 0)).
-			Render("Plan failed: " + strings.Join(strings.Fields(m.planErr.Error()), " "))
+	width := max(m.width-2, 0)
+	style := helpStyle.MaxWidth(width)
+	// Terraform errors span several lines; squeeze them onto the status line.
+	failed := func(what string, err error) string {
+		return errorStyle.MaxWidth(width).Render(what + " failed: " + strings.Join(strings.Fields(err.Error()), " "))
 	}
 
+	switch {
+	case m.applying:
+		return style.Render("Applying…")
+	case m.targeting != "":
+		return style.Render(fmt.Sprintf("Planning changes for %s…", m.targeting))
+	case m.actionErr != nil:
+		return failed("Apply", m.actionErr)
+	}
+
+	status := ""
+	switch {
+	case m.loading:
+		status = "Reading state and planning…"
+	case m.planning:
+		status = "Planning…"
+	case m.planErr != nil:
+		return failed("Plan", m.planErr)
+	default:
+		status = summarize(m.changes())
+	}
+	if m.notice != "" {
+		status = m.notice + " " + status
+	}
+	return style.Render(status)
+}
+
+// summarize counts changes like the last line of `terraform plan`.
+func summarize(changes []tfstate.Change) string {
 	add, change, destroy := 0, 0, 0
-	for _, c := range m.changes {
+	for _, c := range changes {
 		switch c.Action {
 		case tfstate.Create:
 			add++
@@ -494,26 +708,45 @@ func (m model) statusView() string {
 		}
 	}
 	if add+change+destroy == 0 {
-		return style.Render("No changes.")
+		return "No changes."
 	}
-	return style.Render(fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy.", add, change, destroy))
+	return fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy.", add, change, destroy)
 }
 
 func (m model) helpView() string {
 	if m.focus == detailsPane {
-		return helpStyle.Render("↑/↓ scroll • tab table • esc close • ctrl+r refresh • q quit")
+		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • tab table • esc close • shift+p plan • q quit")
 	}
-	extra := "enter details • ctrl+r refresh"
+	extra := "enter details • a apply • shift+a apply all • shift+p plan"
 	if m.showDetails {
 		extra += " • tab details • esc close"
 	}
 	return m.table.HelpView() + helpStyle.Render(" • "+extra)
 }
 
+// confirmView is a full-screen dialog showing every change that confirming
+// would apply, with its attribute diff, in a scrollable body.
+func (m model) confirmView() string {
+	lines := []string{
+		titleStyle.Render(m.confirm.title),
+		"",
+		m.confirm.body.View(),
+		"",
+		summarize(m.confirm.plan.Changes),
+		helpStyle.Render("↑/↓ scroll • y apply • n cancel"),
+	}
+	return baseStyle.
+		BorderForeground(activeBorderColor).
+		Padding(0, 1).
+		Render(strings.Join(lines, "\n"))
+}
+
 func (m model) View() tea.View {
 	var content string
 	switch {
-	// On a refresh, keep showing the previous rows until the new state arrives.
+	case m.confirm != nil:
+		content = m.confirmView()
+	// While planning again, keep showing the previous rows until the new state arrives.
 	case m.loading && len(m.rows) == 0:
 		content = messageStyle.Render(fmt.Sprintf("Loading Terraform state from %s…", m.dir))
 	case m.err != nil:

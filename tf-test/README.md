@@ -18,7 +18,7 @@ Right after apply, the plan shows no changes.
 
 ## Producing changes
 
-Edit `terraform.tfvars`, then press ctrl+r in the app.
+Edit `terraform.tfvars`, then press shift+p in the app to plan again.
 
 | Edit                         | Resource                                   | Action |
 |------------------------------|--------------------------------------------|--------|
