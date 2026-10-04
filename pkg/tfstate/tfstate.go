@@ -1,4 +1,4 @@
-// Package tfstate reads Terraform state through `terraform show -json`.
+// Package tfstate reads Terraform state and plans through terraform-exec.
 package tfstate
 
 import (
@@ -13,10 +13,16 @@ import (
 	tfjson "github.com/hashicorp/terraform-json"
 )
 
-// binaries are the executables tried, in order, to read the state.
+// binaries are the executables tried, in order, to run Terraform.
 var binaries = []string{"terraform", "tofu"}
 
-// Resource is a single resource or data source in the state.
+// Placeholders that replace attribute values which can't be shown.
+const (
+	SensitivePlaceholder = "(sensitive)"
+	UnknownPlaceholder   = "(known after apply)"
+)
+
+// Resource is a single resource or data source in the state or the plan.
 type Resource struct {
 	Address  string
 	Mode     string // "managed" or "data"
@@ -24,24 +30,27 @@ type Resource struct {
 	Name     string
 	Module   string // empty for the root module
 	Provider string
-	// Attributes holds the resource's values, with sensitive ones replaced by SensitivePlaceholder.
+	// Attributes holds the resource's values in the state, with sensitive ones
+	// replaced by SensitivePlaceholder. It is nil for resources not yet created.
 	Attributes map[string]any
+	// Change is the resource's planned change, or nil when no plan is attached.
+	Change *Change
 }
 
-// SensitivePlaceholder replaces sensitive attribute values.
-const SensitivePlaceholder = "(sensitive)"
+// Action returns the resource's planned action, or NoOp when no plan is attached.
+func (r Resource) Action() Action {
+	if r.Change == nil {
+		return NoOp
+	}
+	return r.Change.Action
+}
 
 // Load returns every resource in the state of the Terraform working directory dir.
 // The directory must already be initialized with `terraform init`.
 func Load(ctx context.Context, dir string) ([]Resource, error) {
-	execPath, err := findBinary()
+	tf, err := newTerraform(dir)
 	if err != nil {
 		return nil, err
-	}
-
-	tf, err := tfexec.NewTerraform(dir, execPath)
-	if err != nil {
-		return nil, fmt.Errorf("setting up %s: %w", execPath, err)
 	}
 
 	state, err := tf.Show(ctx)
@@ -60,6 +69,18 @@ func Load(ctx context.Context, dir string) ([]Resource, error) {
 	return resources, nil
 }
 
+func newTerraform(dir string) (*tfexec.Terraform, error) {
+	execPath, err := findBinary()
+	if err != nil {
+		return nil, err
+	}
+	tf, err := tfexec.NewTerraform(dir, execPath)
+	if err != nil {
+		return nil, fmt.Errorf("setting up %s: %w", execPath, err)
+	}
+	return tf, nil
+}
+
 func findBinary() (string, error) {
 	for _, name := range binaries {
 		if path, err := exec.LookPath(name); err == nil {
@@ -67,6 +88,10 @@ func findBinary() (string, error) {
 		}
 	}
 	return "", errors.New("neither terraform nor tofu found in PATH")
+}
+
+func trimProvider(name string) string {
+	return strings.TrimPrefix(name, "registry.terraform.io/")
 }
 
 // collect appends the resources of module and all its descendants to out.
@@ -82,7 +107,7 @@ func collect(module *tfjson.StateModule, out *[]Resource) error {
 			Type:       r.Type,
 			Name:       r.Name,
 			Module:     module.Address,
-			Provider:   strings.TrimPrefix(r.ProviderName, "registry.terraform.io/"),
+			Provider:   trimProvider(r.ProviderName),
 			Attributes: attributes,
 		})
 	}
@@ -95,7 +120,6 @@ func collect(module *tfjson.StateModule, out *[]Resource) error {
 }
 
 // maskSensitive replaces the values that sensitiveJSON marks as sensitive.
-// sensitiveJSON mirrors the shape of values, with true at each sensitive leaf.
 func maskSensitive(values map[string]any, sensitiveJSON json.RawMessage) (map[string]any, error) {
 	if len(sensitiveJSON) == 0 {
 		return values, nil
@@ -104,21 +128,22 @@ func maskSensitive(values map[string]any, sensitiveJSON json.RawMessage) (map[st
 	if err := json.Unmarshal(sensitiveJSON, &sensitive); err != nil {
 		return nil, err
 	}
-	masked, _ := mask(values, sensitive).(map[string]any)
-	return masked, nil
+	return toMap(mask(values, sensitive, SensitivePlaceholder)), nil
 }
 
-func mask(value, sensitive any) any {
-	switch s := sensitive.(type) {
+// mask replaces the parts of value that marks flags with placeholder.
+// marks mirrors the shape of value, with true at each flagged leaf.
+func mask(value, marks any, placeholder string) any {
+	switch m := marks.(type) {
 	case bool:
-		if s {
-			return SensitivePlaceholder
+		if m {
+			return placeholder
 		}
 	case map[string]any:
 		if v, ok := value.(map[string]any); ok {
 			out := make(map[string]any, len(v))
 			for key, val := range v {
-				out[key] = mask(val, s[key])
+				out[key] = mask(val, m[key], placeholder)
 			}
 			return out
 		}
@@ -126,14 +151,19 @@ func mask(value, sensitive any) any {
 		if v, ok := value.([]any); ok {
 			out := make([]any, len(v))
 			for i, val := range v {
-				var si any
-				if i < len(s) {
-					si = s[i]
+				var mi any
+				if i < len(m) {
+					mi = m[i]
 				}
-				out[i] = mask(val, si)
+				out[i] = mask(val, mi, placeholder)
 			}
 			return out
 		}
 	}
 	return value
+}
+
+func toMap(value any) map[string]any {
+	m, _ := value.(map[string]any)
+	return m
 }
