@@ -56,6 +56,30 @@ type SavedPlan struct {
 // planned change of every resource. With targets, the plan is limited to
 // those resource addresses and the resources they depend on.
 func Plan(ctx context.Context, dir string, targets ...string) (*SavedPlan, error) {
+	return plan(ctx, dir, false, targets)
+}
+
+// PlanDestroy plans destroying the real resources at the given addresses,
+// along with the resources that depend on them. Without targets, it plans
+// destroying everything.
+func PlanDestroy(ctx context.Context, dir string, targets ...string) (*SavedPlan, error) {
+	return plan(ctx, dir, true, targets)
+}
+
+// RemoveFromState makes Terraform forget the resource at address without
+// destroying the real resource, like `terraform state rm`.
+func RemoveFromState(ctx context.Context, dir, address string) error {
+	tf, err := newTerraform(dir)
+	if err != nil {
+		return err
+	}
+	if err := tf.StateRm(ctx, address); err != nil {
+		return fmt.Errorf("removing %s from state: %w", address, err)
+	}
+	return nil
+}
+
+func plan(ctx context.Context, dir string, destroy bool, targets []string) (*SavedPlan, error) {
 	tf, err := newTerraform(dir)
 	if err != nil {
 		return nil, err
@@ -69,7 +93,7 @@ func Plan(ctx context.Context, dir string, targets ...string) (*SavedPlan, error
 
 	// Don't hold the state lock while planning: it can take a while. Applying
 	// takes the lock and refuses the plan if the state changed in between.
-	opts := []tfexec.PlanOption{tfexec.Out(p.file()), tfexec.Lock(false)}
+	opts := []tfexec.PlanOption{tfexec.Out(p.file()), tfexec.Lock(false), tfexec.Destroy(destroy)}
 	for _, target := range targets {
 		opts = append(opts, tfexec.Target(target))
 	}

@@ -101,40 +101,74 @@ type planLoadedMsg struct {
 	err  error
 }
 
-// targetPlanMsg carries the result of planning the changes of one resource.
+// targetPlanMsg carries the result of planning changes for one resource.
 type targetPlanMsg struct {
 	address string
+	destroy bool
 	plan    *tfstate.SavedPlan
 	err     error
 }
 
-// appliedMsg carries the result of applying a plan.
-type appliedMsg struct {
-	err error
+// actionDoneMsg carries the result of applying a plan or removing a
+// resource from the state.
+type actionDoneMsg struct {
+	done string // notice to show on success
+	err  error
 }
 
-// confirmation is a plan waiting for the user to confirm applying it.
+// confirmation is an action waiting for the user to confirm it: either
+// applying a plan or removing a resource from the state.
 type confirmation struct {
-	title    string
-	plan     *tfstate.SavedPlan
-	targeted bool           // the plan was made only for this confirmation
-	body     viewport.Model // every planned change with its attribute diff
+	title   string
+	verb    string // what pressing y does, for the help line
+	summary string
+	body    viewport.Model // details of everything the action changes
+
+	plan     *tfstate.SavedPlan // the plan to apply, or nil
+	targeted bool               // the plan was made only for this confirmation
+	remove   string             // address to remove from the state, if plan is nil
 }
 
-func newConfirmation(title string, plan *tfstate.SavedPlan, targeted bool) *confirmation {
-	var changes []string
-	if targeted && countChanges(plan.Changes) > 1 {
-		changes = append(changes, helpStyle.Render("Includes the resources it depends on."))
+// confirmPlan asks to apply plan, showing every planned change with its
+// attribute diff. note is shown first when the plan changes more than one resource.
+func confirmPlan(title, verb, note string, plan *tfstate.SavedPlan, targeted bool) *confirmation {
+	var sections []string
+	if note != "" && countChanges(plan.Changes) > 1 {
+		sections = append(sections, helpStyle.Render(note))
 	}
 	for _, c := range plan.Changes {
 		if c.Action != tfstate.NoOp {
-			changes = append(changes, renderDetails(tfstate.Resource{Address: c.Address, Change: &c}))
+			sections = append(sections, renderDetails(tfstate.Resource{Address: c.Address, Change: &c}))
 		}
 	}
+	return newConfirmation(confirmation{
+		title:    title,
+		verb:     verb,
+		summary:  summarize(plan.Changes),
+		plan:     plan,
+		targeted: targeted,
+	}, sections)
+}
 
-	body := viewport.New()
-	body.SetContent(strings.Join(changes, "\n\n"))
-	return &confirmation{title: title, plan: plan, targeted: targeted, body: body}
+// confirmRemove asks to remove r from the state, showing its current attributes.
+func confirmRemove(r tfstate.Resource) *confirmation {
+	sections := []string{
+		helpStyle.Render("Terraform will forget this resource. The real resource is not destroyed,\n" +
+			"and a later plan will offer to create it again if it is still in the configuration."),
+		renderDetails(tfstate.Resource{Address: r.Address, Attributes: r.Attributes}),
+	}
+	return newConfirmation(confirmation{
+		title:   fmt.Sprintf("Remove %s from state?", r.Address),
+		verb:    "remove from state",
+		summary: "1 to remove from state.",
+		remove:  r.Address,
+	}, sections)
+}
+
+func newConfirmation(c confirmation, sections []string) *confirmation {
+	c.body = viewport.New()
+	c.body.SetContent(strings.Join(sections, "\n\n"))
+	return &c
 }
 
 func countChanges(changes []tfstate.Change) int {
@@ -175,11 +209,12 @@ type model struct {
 	planning bool
 	planErr  error
 
-	confirm   *confirmation // shown as a dialog while non-nil
-	targeting string        // address being planned for a targeted apply
-	applying  bool
-	actionErr error  // failure of the last targeted plan or apply
-	notice    string // outcome of the last action, shown on the status line
+	confirm       *confirmation // shown as a dialog while non-nil
+	targeting     string        // address being planned for a targeted apply or destroy
+	targetDestroy bool          // the targeted plan destroys
+	running       string        // status text while applying or removing from state
+	actionErr     error         // failure of the last targeted plan, apply or removal
+	notice        string        // outcome of the last action, shown on the status line
 }
 
 // changes returns the planned changes, or none if there is no plan.
@@ -192,7 +227,25 @@ func (m model) changes() []tfstate.Change {
 
 // busy reports whether Terraform is running, so no other run should start.
 func (m model) busy() bool {
-	return m.loading || m.planning || m.applying || m.targeting != ""
+	return m.loading || m.planning || m.running != "" || m.targeting != ""
+}
+
+// selected returns the resource under the cursor, or the one open in the
+// details pane when that is focused.
+func (m model) selected() (tfstate.Resource, bool) {
+	i := m.table.Cursor()
+	if m.focus == detailsPane {
+		i = m.indexOf(m.detailsAddress)
+	}
+	if i < 0 || i >= len(m.rows) {
+		return tfstate.Resource{}, false
+	}
+	return m.rows[i], true
+}
+
+// inState reports whether address is in the state, rather than only planned.
+func (m model) inState(address string) bool {
+	return slices.ContainsFunc(m.state, func(r tfstate.Resource) bool { return r.Address == address })
 }
 
 // Run shows the state and planned changes of the Terraform working directory
@@ -276,16 +329,28 @@ func readPlan(dir string) planLoadedMsg {
 	return planLoadedMsg{plan: plan, err: err}
 }
 
-func planTarget(dir, address string) tea.Cmd {
+// planTarget plans applying, or with destroy destroying, just one resource.
+func planTarget(dir, address string, destroy bool) tea.Cmd {
 	return func() tea.Msg {
-		plan, err := tfstate.Plan(context.Background(), dir, address)
-		return targetPlanMsg{address: address, plan: plan, err: err}
+		planFn := tfstate.Plan
+		if destroy {
+			planFn = tfstate.PlanDestroy
+		}
+		plan, err := planFn(context.Background(), dir, address)
+		return targetPlanMsg{address: address, destroy: destroy, plan: plan, err: err}
 	}
 }
 
 func apply(plan *tfstate.SavedPlan) tea.Cmd {
 	return func() tea.Msg {
-		return appliedMsg{err: plan.Apply(context.Background())}
+		return actionDoneMsg{done: "Applied.", err: plan.Apply(context.Background())}
+	}
+}
+
+func removeFromState(dir, address string) tea.Cmd {
+	return func() tea.Msg {
+		err := tfstate.RemoveFromState(context.Background(), dir, address)
+		return actionDoneMsg{done: fmt.Sprintf("Removed %s from state.", address), err: err}
 	}
 }
 
@@ -332,18 +397,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.actionErr = msg.err
 		case !msg.plan.HasChanges():
 			msg.plan.Discard()
-			m.notice = fmt.Sprintf("No changes to apply for %s.", msg.address)
+			m.notice = fmt.Sprintf("No changes for %s.", msg.address)
+		case msg.destroy:
+			m.confirm = confirmPlan(fmt.Sprintf("Destroy %s?", msg.address), "destroy",
+				"Includes the resources that depend on it.", msg.plan, true)
+			m.layout()
 		default:
-			m.confirm = newConfirmation(fmt.Sprintf("Apply changes for %s?", msg.address), msg.plan, true)
+			m.confirm = confirmPlan(fmt.Sprintf("Apply changes for %s?", msg.address), "apply",
+				"Includes the resources it depends on.", msg.plan, true)
 			m.layout()
 		}
 		return m, nil
-	case appliedMsg:
-		m.applying = false
+	case actionDoneMsg:
+		m.running = ""
 		if msg.err != nil {
 			m.actionErr = msg.err
 		} else {
-			m.notice = "Applied."
+			m.notice = msg.done
 		}
 		// Even a failed apply may have changed some resources, so plan again either way.
 		m.loading, m.planning = true, true
@@ -359,9 +429,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch msg.String() {
 		case "q", "ctrl+c":
-			// Quitting would leave Terraform applying with nobody watching.
-			if m.applying {
-				m.notice = "Apply in progress; quit once it has finished."
+			// Quitting would leave Terraform changing things with nobody watching.
+			if m.running != "" {
+				m.notice = "Terraform is still running; quit once it has finished."
 				return m, nil
 			}
 			return m, tea.Quit
@@ -383,7 +453,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.notice = "No changes to apply."
 				return m, nil
 			}
-			m.confirm = newConfirmation("Apply all changes?", m.plan, false)
+			m.confirm = confirmPlan("Apply all changes?", "apply", "", m.plan, false)
 			m.layout()
 			return m, nil
 		case "a":
@@ -391,22 +461,55 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.clearOutcome()
-			i := m.table.Cursor()
-			if m.focus == detailsPane {
-				i = m.indexOf(m.detailsAddress)
-			}
-			if i < 0 || i >= len(m.rows) {
+			r, ok := m.selected()
+			if !ok {
 				return m, nil
 			}
-			r := m.rows[i]
 			if r.Action() == tfstate.NoOp {
 				m.notice = fmt.Sprintf("No changes to apply for %s.", r.Address)
 				return m, nil
 			}
 			// Plan again for just this resource, so the dialog shows exactly what
 			// will be applied, including resources it depends on.
-			m.targeting = r.Address
-			return m, planTarget(m.dir, r.Address)
+			m.targeting, m.targetDestroy = r.Address, false
+			return m, planTarget(m.dir, r.Address, false)
+		case "D", "shift+d":
+			if m.busy() {
+				return m, nil
+			}
+			m.clearOutcome()
+			r, ok := m.selected()
+			if !ok {
+				return m, nil
+			}
+			switch {
+			case !m.inState(r.Address):
+				m.notice = fmt.Sprintf("%s doesn't exist yet.", r.Address)
+				return m, nil
+			case r.Mode == "data":
+				m.notice = "Data sources can't be destroyed."
+				return m, nil
+			}
+			// Plan the destroy first, so the dialog shows exactly what will be
+			// destroyed, including resources that depend on this one.
+			m.targeting, m.targetDestroy = r.Address, true
+			return m, planTarget(m.dir, r.Address, true)
+		case "d":
+			if m.busy() {
+				return m, nil
+			}
+			m.clearOutcome()
+			r, ok := m.selected()
+			if !ok {
+				return m, nil
+			}
+			if !m.inState(r.Address) {
+				m.notice = fmt.Sprintf("%s isn't in the state.", r.Address)
+				return m, nil
+			}
+			m.confirm = confirmRemove(r)
+			m.layout()
+			return m, nil
 		case "enter":
 			if m.focus == tablePane {
 				m.openDetails()
@@ -447,16 +550,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) updateConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y":
-		plan := m.confirm.plan
+		c := m.confirm
 		m.confirm = nil
-		m.applying = true
-		return m, apply(plan)
+		if c.plan == nil {
+			m.running = fmt.Sprintf("Removing %s from state…", c.remove)
+			return m, removeFromState(m.dir, c.remove)
+		}
+		m.running = "Applying…"
+		return m, apply(c.plan)
 	case "n", "esc", "q", "ctrl+c":
 		if m.confirm.targeted {
 			m.confirm.plan.Discard()
 		}
 		m.confirm = nil
-		m.notice = "Apply canceled."
+		m.notice = "Canceled."
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -666,12 +773,15 @@ func (m model) statusView() string {
 	}
 
 	switch {
-	case m.applying:
-		return style.Render("Applying…")
+	case m.running != "":
+		return style.Render(m.running)
+	case m.targeting != "" && m.targetDestroy:
+		return style.Render(fmt.Sprintf("Planning destruction of %s…", m.targeting))
 	case m.targeting != "":
 		return style.Render(fmt.Sprintf("Planning changes for %s…", m.targeting))
 	case m.actionErr != nil:
-		return failed("Apply", m.actionErr)
+		// The error already says what failed, e.g. "applying: …".
+		return errorStyle.MaxWidth(width).Render("Failed: " + strings.Join(strings.Fields(m.actionErr.Error()), " "))
 	}
 
 	status := ""
@@ -715,9 +825,9 @@ func summarize(changes []tfstate.Change) string {
 
 func (m model) helpView() string {
 	if m.focus == detailsPane {
-		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • tab table • esc close • shift+p plan • q quit")
+		return helpStyle.Render("↑/↓ scroll • a apply • shift+a apply all • d remove from state • shift+d destroy • tab table • esc close • shift+p plan • q quit")
 	}
-	extra := "enter details • a apply • shift+a apply all • shift+p plan"
+	extra := "enter details • a apply • shift+a apply all • d remove from state • shift+d destroy • shift+p plan"
 	if m.showDetails {
 		extra += " • tab details • esc close"
 	}
@@ -732,8 +842,8 @@ func (m model) confirmView() string {
 		"",
 		m.confirm.body.View(),
 		"",
-		summarize(m.confirm.plan.Changes),
-		helpStyle.Render("↑/↓ scroll • y apply • n cancel"),
+		m.confirm.summary,
+		helpStyle.Render(fmt.Sprintf("↑/↓ scroll • y %s • n cancel", m.confirm.verb)),
 	}
 	return baseStyle.
 		BorderForeground(activeBorderColor).

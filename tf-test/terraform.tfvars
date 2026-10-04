@@ -2,5 +2,5 @@
 greeting        = "Hello, tf-mankeli!"
 release         = "v1"
 password_length = 16
-pet_count       = 3
+pet_count       = 4
 pet_prefix      = "dev"
