@@ -50,10 +50,17 @@ func (m model) statusView() string {
 	return style.Render(status)
 }
 
-// summarize counts changes like the last line of `terraform plan`.
+// summarize counts changes like the last line of `terraform plan`, adding
+// how many outputs change.
 func summarize(changes []tfstate.Change) string {
-	add, change, destroy := 0, 0, 0
+	add, change, destroy, outputs := 0, 0, 0, 0
 	for _, c := range changes {
+		if c.Mode == tfstate.OutputMode {
+			if c.Action != tfstate.NoOp {
+				outputs++
+			}
+			continue
+		}
 		switch c.Action {
 		case tfstate.Create:
 			add++
@@ -66,17 +73,23 @@ func summarize(changes []tfstate.Change) string {
 			destroy++
 		}
 	}
-	if add+change+destroy == 0 {
-		return "No changes."
+	plan := "No changes."
+	if add+change+destroy > 0 {
+		plan = fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy.", add, change, destroy)
+	} else if outputs > 0 {
+		plan = "No resource changes."
 	}
-	return fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy.", add, change, destroy)
+	if outputs > 0 {
+		plan += fmt.Sprintf(" Outputs: %d to change.", outputs)
+	}
+	return plan
 }
 
 // helpView lists the keys that do something right now, built from the same
 // bindings handleKey matches against.
 func (m model) helpView() string {
 	if m.focus == detailsPane {
-		line := append([]key.Binding{keys.Scroll}, keys.actionKeys()...)
+		line := append([]key.Binding{keys.Scroll}, keys.actionKeysFor(m.selected())...)
 		line = append(line, withDesc(keys.Focus, "table"), keys.Close, keys.Plan, keys.Quit)
 		return helpLine(line...)
 	}
@@ -85,7 +98,7 @@ func (m model) helpView() string {
 		return helpLine(keys.Scroll, withDesc(keys.Close, "dismiss"), keys.Plan, keys.Quit)
 	}
 
-	line := append([]key.Binding{keys.Details}, keys.actionKeys()...)
+	line := append([]key.Binding{keys.Details}, keys.actionKeysFor(m.selected())...)
 	line = append(line, keys.Plan)
 	if _, err := m.failure(); err != nil {
 		line = append(line, keys.Error)

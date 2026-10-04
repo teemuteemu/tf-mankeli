@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-exec/tfexec"
 	tfjson "github.com/hashicorp/terraform-json"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // binaries are the executables tried, in order, to run Terraform.
@@ -22,10 +25,18 @@ const (
 	UnknownPlaceholder   = "(known after apply)"
 )
 
-// Resource is a single resource or data source in the state or the plan.
+// OutputMode is the Mode of root module outputs, which are listed alongside
+// resources. An output's Attributes hold its value under OutputValueKey.
+const (
+	OutputMode     = "output"
+	OutputValueKey = "value"
+)
+
+// Resource is a single resource, data source or root module output in the
+// state or the plan.
 type Resource struct {
 	Address  string
-	Mode     string // "managed" or "data"
+	Mode     string // "managed", "data" or OutputMode
 	Type     string
 	Name     string
 	Module   string // empty for the root module
@@ -39,6 +50,11 @@ type Resource struct {
 	Change *Change
 }
 
+// IsOutput reports whether r is a root module output rather than a resource.
+func (r Resource) IsOutput() bool {
+	return r.Mode == OutputMode
+}
+
 // Action returns the resource's planned action, or NoOp when no plan is attached.
 func (r Resource) Action() Action {
 	if r.Change == nil {
@@ -47,7 +63,8 @@ func (r Resource) Action() Action {
 	return r.Change.Action
 }
 
-// Load returns every resource in the state of the Terraform working directory dir.
+// Load returns every resource in the state of the Terraform working directory
+// dir, followed by the root module outputs.
 // The directory must already be initialized with `terraform init`.
 func Load(ctx context.Context, dir string) ([]Resource, error) {
 	tf, err := newTerraform(dir)
@@ -68,7 +85,35 @@ func Load(ctx context.Context, dir string) ([]Resource, error) {
 	if err := collect(state.Values.RootModule, &resources); err != nil {
 		return nil, err
 	}
-	return resources, nil
+	return append(resources, outputsOf(state.Values.Outputs)...), nil
+}
+
+// outputsOf lists the root module outputs by name, masking sensitive ones.
+func outputsOf(outputs map[string]*tfjson.StateOutput) []Resource {
+	var out []Resource
+	for _, name := range slices.Sorted(maps.Keys(outputs)) {
+		o := outputs[name]
+		value := o.Value
+		if o.Sensitive {
+			value = SensitivePlaceholder
+		}
+		typ := ""
+		if o.Type != cty.NilType {
+			typ = o.Type.FriendlyName()
+		}
+		out = append(out, Resource{
+			Address:    outputAddress(name),
+			Mode:       OutputMode,
+			Type:       typ,
+			Name:       name,
+			Attributes: map[string]any{OutputValueKey: value},
+		})
+	}
+	return out
+}
+
+func outputAddress(name string) string {
+	return OutputMode + "." + name
 }
 
 func newTerraform(dir string) (*tfexec.Terraform, error) {

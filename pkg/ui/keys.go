@@ -84,14 +84,19 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // target picks the resource an action applies to and reports whether the
-// action may run at all: not while Terraform is busy, and not with nothing
-// selected. It clears the last outcome, making room for this action's.
+// action may run at all: not while Terraform is busy, not with nothing
+// selected, and not on an output, which Terraform can't target. It clears the
+// last outcome, making room for this action's.
 func (m model) target() (model, tfstate.Resource, bool) {
 	if m.busy() {
 		return m, tfstate.Resource{}, false
 	}
 	m.clearOutcome()
 	r, ok := m.selected()
+	if ok && r.IsOutput() {
+		m.notice = "Outputs can't be targeted; they change when all changes are applied."
+		return m, r, false
+	}
 	return m, r, ok
 }
 

@@ -3,6 +3,7 @@ package tfstate
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,7 +27,7 @@ const (
 	Other Action = "?"
 )
 
-// Change is the planned change of a single resource.
+// Change is the planned change of a single resource or root module output.
 type Change struct {
 	Address  string
 	Mode     string
@@ -196,6 +197,31 @@ func changesOf(plan *tfjson.Plan) []Change {
 			After:    toMap(markUnknown(after, rc.Change.AfterUnknown)),
 		})
 	}
+	for _, name := range slices.Sorted(maps.Keys(plan.OutputChanges)) {
+		oc := plan.OutputChanges[name]
+		if oc == nil {
+			continue
+		}
+		// An output is sensitive as a whole, but parts of its value can be
+		// unknown, so its unknown flags mirror the value like a resource's.
+		action := actionOf(oc.Actions)
+		var before, after map[string]any
+		if action != Create {
+			before = map[string]any{OutputValueKey: mask(oc.Before, oc.BeforeSensitive, SensitivePlaceholder)}
+		}
+		if action != Delete {
+			value := mask(oc.After, oc.AfterSensitive, SensitivePlaceholder)
+			after = map[string]any{OutputValueKey: markUnknown(value, oc.AfterUnknown)}
+		}
+		changes = append(changes, Change{
+			Address: outputAddress(name),
+			Mode:    OutputMode,
+			Name:    name,
+			Action:  action,
+			Before:  before,
+			After:   after,
+		})
+	}
 	return changes
 }
 
@@ -255,7 +281,8 @@ func markUnknown(value, unknown any) any {
 }
 
 // Merge attaches each planned change to its resource. Resources the plan will
-// create, and so aren't in the state yet, are appended at the end.
+// create, and so aren't in the state yet, are appended after the others, and
+// outputs are kept last.
 func Merge(resources []Resource, changes []Change) []Resource {
 	merged := slices.Clone(resources)
 	index := make(map[string]int, len(merged))
@@ -277,5 +304,18 @@ func Merge(resources []Resource, changes []Change) []Resource {
 			Change:   &c,
 		})
 	}
+	slices.SortStableFunc(merged, func(a, b Resource) int {
+		return cmpBool(a.IsOutput(), b.IsOutput())
+	})
 	return merged
+}
+
+func cmpBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case a:
+		return 1
+	}
+	return -1
 }
