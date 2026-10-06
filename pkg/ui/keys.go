@@ -12,6 +12,9 @@ import (
 // handleKey runs the action a key is bound to. A dialog takes every key while
 // it is open; keys bound to nothing scroll whichever pane is showing.
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.output != nil {
+		return m.updateOutput(msg)
+	}
 	if m.confirm != nil {
 		return m.updateConfirm(msg)
 	}

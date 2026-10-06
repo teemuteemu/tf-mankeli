@@ -3,6 +3,7 @@ package tfstate
 import (
 	"context"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -152,9 +153,14 @@ func plan(ctx context.Context, dir string, destroy bool, targets []string) (*Sav
 	return p, nil
 }
 
-// Apply applies the plan and then discards it.
-func (p *SavedPlan) Apply(ctx context.Context) error {
+// Apply applies the plan and then discards it. Terraform's output is
+// written to out as it runs.
+func (p *SavedPlan) Apply(ctx context.Context, out io.Writer) error {
 	defer p.Discard()
+	p.tf.SetStdout(out)
+	p.tf.SetStderr(out)
+	defer p.tf.SetStdout(io.Discard)
+	defer p.tf.SetStderr(io.Discard)
 	if err := p.tf.Apply(ctx, tfexec.DirOrPlan(p.file())); err != nil {
 		return fmt.Errorf("applying: %w", err)
 	}

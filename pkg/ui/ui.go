@@ -50,6 +50,7 @@ type model struct {
 
 	confirm       *confirmation // shown as a dialog while non-nil
 	prompt        *prompt       // shown as a dialog while non-nil
+	output        *output       // Terraform's apply output, shown as a window while non-nil
 	targeting     string        // address being planned for a targeted apply or destroy
 	targetDestroy bool          // the targeted plan destroys
 	running       string        // status text while applying or removing from state
@@ -151,8 +152,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.layout()
 		}
 		return m, nil
+	case outputMsg:
+		// Keep draining after the window is closed, so Terraform never blocks writing.
+		if m.output != nil {
+			m.output.append(msg.text)
+		}
+		return m, waitForOutput(msg.ch)
 	case actionDoneMsg:
 		m.running = ""
+		if m.output != nil {
+			m.output.done, m.output.err = true, msg.err
+		}
 		if msg.err != nil {
 			m.actionErr = msg.err
 		} else {
@@ -199,6 +209,9 @@ func (m model) View() tea.View {
 			)
 		}
 		content += "\n  " + m.statusView() + "\n  " + m.helpView()
+	}
+	if m.output != nil {
+		content = m.overlayOutput(content)
 	}
 
 	v := tea.NewView(content)

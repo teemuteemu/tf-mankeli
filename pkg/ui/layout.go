@@ -42,6 +42,17 @@ func (m *model) layout() {
 		m.confirm.body.SetHeight(max(m.height-borderSize-dialogLines, 0))
 	}
 
+	if m.output != nil {
+		const (
+			dialogPadding = 2 // one cell left and right
+			dialogLines   = 5 // title, status, help and the blank lines between
+		)
+		width, height := m.outputSize()
+		m.output.body.SetWidth(max(width-borderSize-dialogPadding, 0))
+		m.output.body.SetHeight(max(height-borderSize-dialogLines, 0))
+		m.output.render()
+	}
+
 	if m.prompt != nil {
 		const (
 			dialogPadding = 2 // one cell left and right

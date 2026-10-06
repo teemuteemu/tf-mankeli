@@ -19,7 +19,7 @@ type column struct {
 var columns = []column{
 	{title: "", width: 3}, // planned action
 	{title: "", width: 7}, // tainted marker
-	{title: "Address", weight: 4},
+	{title: "Address", weight: 3},
 	{title: "Type", weight: 3},
 	{title: "Name", weight: 2},
 	{title: "Module", weight: 2},

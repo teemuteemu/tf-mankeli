@@ -118,6 +118,8 @@ func (m model) updateConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, removeFromState(m.dir, c.remove)
 		}
 		m.running = "Applying…"
+		m.output = newOutput(strings.TrimSuffix(c.title, "?"))
+		m.layout()
 		return m, apply(c.plan)
 	case key.Matches(msg, keys.Cancel):
 		if m.confirm.targeted {

@@ -67,10 +67,16 @@ func planTarget(dir, address string, destroy bool) tea.Cmd {
 	}
 }
 
+// apply applies plan, streaming Terraform's output as outputMsgs before the
+// final actionDoneMsg.
 func apply(plan *tfstate.SavedPlan) tea.Cmd {
-	return func() tea.Msg {
-		return actionDoneMsg{done: "Applied.", err: plan.Apply(context.Background())}
+	ch := make(chan string, 64)
+	run := func() tea.Msg {
+		err := plan.Apply(context.Background(), chanWriter(ch))
+		close(ch)
+		return actionDoneMsg{done: "Applied.", err: err}
 	}
+	return tea.Batch(run, waitForOutput(ch))
 }
 
 func taint(dir, address string) tea.Cmd {
